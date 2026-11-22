@@ -44,7 +44,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       deviceName: ${{ steps.compile.outputs.deviceName }}
       fileDate: ${{ steps.compile.outputs.fileDate }}
