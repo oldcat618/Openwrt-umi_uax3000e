@@ -1,15 +1,3 @@
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-#
-# File: .github/workflows/openwrt-bulder.yml
-# Description: Build OpenWrt using GitHub Actions
-#
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
-#
-
 name: OpenWrt Builder
 
 on:
@@ -36,15 +24,6 @@ on:
         default: false
         type: boolean
 
-      default_theme:
-        description: 'Select Default Theme'
-        required: false
-        default: 'bootstrap'
-        type: choice
-        options:
-          - argon
-          - bootstrap
-
 env:
   REPO_URL: https://github.com/${{ github.event.inputs.build_version }}
   REPO_BRANCH: ${{ github.event.inputs.build_version == 'padavanonly/immortalwrt-mt798x-6.6' && 'openwrt-24.10-6.6' || github.event.inputs.build_version == 'Muffinbit/openwrt' && 'main' || 'master' }}
@@ -56,7 +35,6 @@ env:
   DIY_P2_SH: diy-part2.sh
   DEFAULT_LAN: ${{ github.event.inputs.build_version == 'padavanonly/immortalwrt-mt798x-6.6' && '192.168.6.1' || '192.168.1.1' }}
   LAN_IP: ${{ github.event.inputs.lan_ip }}
-#  DEFAULT_THEME: ${{ github.event.inputs.default_theme }}
   DEFAULT_HOSTNAME: ${{ github.event.inputs.build_version == 'Muffinbit/openwrt' && 'OpenWrt' || 'ImmortalWrt' }}
   SSH: ${{ format('{0}', github.event.inputs.ssh) }}
   UPLOAD_BIN_DIR: false
@@ -68,59 +46,60 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     outputs:
-      deviceName: ${{ env.DEVICE_NAME }}
-      fileDate: ${{ env.FILE_DATE }}
+      deviceName: ${{ steps.compile.outputs.deviceName }}
+      fileDate: ${{ steps.compile.outputs.fileDate }}
 
     steps:
-      # ====================== System Preparation ======================
-      - name: Check Disk Space (Before Optimization)
-        run: |
-          echo "🛠️ Disk Space Before Optimization:"
-          echo "=============================================================="
-          df -hT
-          echo "=============================================================="
-
-      - name: Optimize Disk Space
-        uses: hugoalh/disk-space-optimizer-ghaction@v0.8.1
-        with:
-          operate_sudo: "True"
-          general_include: ".+"
-          general_exclude: |
-            ^GCC$
-            ^G\+\+$
-            Clang
-            LLVM
-          docker_include: ".+"
-          docker_prune: "True"
-          docker_clean: "True"
-          apt_prune: "True"
-          apt_clean: "True"
-          homebrew_prune: "True"
-          homebrew_clean: "True"
-          npm_prune: "True"
-          npm_clean: "True"
-          os_swap: "True"
-
-      - name: Free Disk Space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 1024
-          swap-size-mb: 1
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
-
-      - name: Check Disk Space (After Optimization)
-        run: |
-          echo "✅ Disk Space After Optimization:"
-          echo "=============================================================="
-          df -hT
-          echo "=============================================================="
-
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Diagnose Disk Layout
+        run: |
+          echo "🩺 Initial Disk Layout:"
+          df -hT
+          echo ""
+          echo "🔍 Locating large files on / (top 20):"
+          sudo du -xh / --max-depth=1 2>/dev/null | sort -rh | head -20 || true
+          echo ""
+          echo "🔍 Files >1G on /:"
+          sudo find / -xdev -type f -size +1G 2>/dev/null -exec ls -lh {} \; | awk '{print $5, $9}' || true
+          echo ""
+          echo "🔍 Loop devices:"
+          sudo losetup -a || true
+
+      - name: Redirect apt/tmp/dpkg to workspace LVM
+        run: |
+          set -euo pipefail
+          WORK_VOL="$(df -T "$GITHUB_WORKSPACE" | tail -1 | awk '{print $7}')"
+          AVAIL_GB="$(df -BG --output=avail "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')"
+          echo "Workspace LVM: $WORK_VOL (${AVAIL_GB}G free)"
+          if [ "$AVAIL_GB" -lt 30 ]; then
+            echo "::error::Workspace LVM only has ${AVAIL_GB}G free, need ≥30G"
+            exit 1
+          fi
+
+          CACHE_ROOT="$GITHUB_WORKSPACE/.ci-cache"
+          sudo mkdir -p \
+            "$CACHE_ROOT/apt-lists" \
+            "$CACHE_ROOT/apt-archives" \
+            "$CACHE_ROOT/tmp" \
+            "$CACHE_ROOT/dpkg-updates"
+          sudo chown -R "$USER:$USER" "$CACHE_ROOT"
+
+          sudo mount --bind "$CACHE_ROOT/apt-lists"     /var/lib/apt/lists
+          sudo mount --bind "$CACHE_ROOT/apt-archives"  /var/cache/apt/archives
+          sudo mount --bind "$CACHE_ROOT/tmp"           /tmp
+          sudo mount --bind "$CACHE_ROOT/dpkg-updates"  /var/lib/dpkg/updates
+
+          echo "✅ After redirect:"
+          df -hT / /var/lib/apt/lists /var/cache/apt/archives /tmp /var/lib/dpkg/updates
+
+      - name: Repair dpkg State
+        run: |
+          sudo rm -rf /var/lib/dpkg/updates/* || true
+          sudo rm -rf /tmp/apt-dpkg-install-* || true
+          sudo dpkg --configure -a || true
+          sudo apt-get -f install -y || true
 
       - name: Check System Resources
         run: |
@@ -128,63 +107,51 @@ jobs:
           echo "--------------------------------------"
           echo "CPU Cores: $(nproc)"
           echo "CPU Model: $(lscpu | grep 'Model name' | cut -d':' -f2 | sed 's/^ *//')"
-          
+          echo ""
           echo "🧠 Memory Information:"
           echo "--------------------------------------"
           free -h
-          
+          echo ""
           echo "💾 Disk Information:"
           echo "--------------------------------------"
           df -hT
 
-      # ====================== Environment Setup ======================
       - name: Initialize Environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
           echo "📦 Installing build dependencies..."
-              sudo apt-get -qq update
-              sudo apt-get -qq install -y --no-install-recommends \
-              ack antlr3 autoconf automake autopoint binutils bison build-essential \
-              bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
-              gcc-multilib g++-multilib gettext xorriso git gperf haveged help2man inttool \
-              libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev \
-              libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev \
-              libreadline-dev libssl-dev libtool lrzsz msmtp ninja-build p7zip p7zip-full \
-              patch pkgconf python3 python3-pyelftools python3-setuptools qemu-utils rsync \
-              scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim \
-              wget xxd zlib1g-dev
-          
-          echo "📦 Installing Node.js dependencies..."
-          sudo apt install npm
-          sudo npm install -g uglify-js
-          
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            ack antlr3 autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gcc-multilib g++-multilib gettext xorriso git gperf haveged help2man \
+            intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev \
+            libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            lrzsz msmtp ninja-build p7zip p7zip-full patch pkgconf python3 \
+            python3-pyelftools python3-setuptools qemu-utils rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim \
+            wget xxd zlib1g-dev
+
           echo "🧹 Cleaning system..."
           sudo apt-get -qq autoremove --purge
           sudo apt-get -qq clean
-          sudo rm -rf \
-            /etc/apt/sources.list.d/* \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /usr/share/dotnet \
-            /usr/local/graalvm \
-            /usr/local/.ghcup \
-            /usr/local/share/powershell \
-            /usr/local/share/chromium \
-            /usr/local/lib/node_modules
-          
+
           echo "⏰ Setting timezone to $TZ..."
           sudo timedatectl set-timezone "$TZ"
-          
-          echo "🔒 Setting workspace permissions..."
-          sudo chown -R $USER:$(id -gn) $GITHUB_WORKSPACE
 
-      # ====================== Source Code Processing ======================
+          echo "🔒 Setting workspace permissions..."
+          sudo chown -R "$USER:$(id -gn)" "$GITHUB_WORKSPACE"
+
+          echo "💾 Disk usage after install:"
+          df -hT / "$GITHUB_WORKSPACE"
+
       - name: Clone Source Code
         run: |
           echo "📥 Cloning source branch: $REPO_BRANCH..."
           rm -rf openwrt
-          git clone --branch=$REPO_BRANCH --depth=50 $REPO_URL openwrt
+          git clone --branch="$REPO_BRANCH" --depth=1 "$REPO_URL" openwrt
 
       - name: Load Custom Feeds
         run: |
@@ -192,34 +159,21 @@ jobs:
             echo "🔄 Loading custom feeds configuration..."
             mv "$FEEDS_CONF" openwrt/feeds.conf.default
           fi
-          
           if [ -e "$DIY_P1_SH" ]; then
             echo "🔧 Executing custom script Part 1..."
             chmod +x "$DIY_P1_SH"
-            cd openwrt
-            "../$DIY_P1_SH"
+            ( cd openwrt && "../$DIY_P1_SH" )
           else
-            echo "⚠️ Warning: $DIY_P1_SH not found"
+            echo "⚠️ $DIY_P1_SH not found, skipping"
           fi
-
-      - name: Repair Git Repository
-        run: |
-          echo "🔧 Repairing Git repository..."
-          cd openwrt
-          git reset --hard HEAD
-          git clean -fdx
-          git fetch --all --depth=100
-          git checkout $REPO_BRANCH
 
       - name: Update Feeds
         run: |
-          echo "🔄 Updating feeds..."
           cd openwrt
           ./scripts/feeds update -a
 
       - name: Install Feeds
         run: |
-          echo "📦 Installing feeds..."
           cd openwrt
           ./scripts/feeds install -a
 
@@ -229,82 +183,62 @@ jobs:
             echo "📁 Loading custom files..."
             mv files openwrt/files
           fi
-          
           if [ -e "$CONFIG_FILE" ]; then
             echo "⚙️ Loading custom configuration..."
             mv "$CONFIG_FILE" openwrt/.config
           fi
-          
-          if [ -e "$DIY_P1_SH" ]; then
+          if [ -e "$DIY_P2_SH" ]; then
             echo "🔧 Executing custom script Part 2..."
             chmod +x "$DIY_P2_SH"
-            cd openwrt
-            "../$DIY_P2_SH"
+            ( cd openwrt && "../$DIY_P2_SH" )
           else
-            echo "⚠️ Warning: $DIY_P2_SH not found"
+            echo "⚠️ $DIY_P2_SH not found, skipping"
           fi
 
-      # ====================== SSH Connection Option ======================
       - name: SSH to Actions
         if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
         uses: P3TERX/ssh2actions@main
-        # Send connection info to Telegram (optional)
-        # You can find related documents here: https://core.telegram.org/bots
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # ====================== Compilation Phase ======================
       - name: Download Packages
         run: |
-          echo "📦 Downloading packages..."
           cd openwrt
           make defconfig
-          make download -j$(nproc) || make download -j1
-          
-          echo "🧹 Cleaning invalid downloads..."
+          make download -j"$(nproc)" || make download -j1
           find dl -size -1024c -delete
 
       - name: Compile Firmware
         id: compile
         run: |
           cd openwrt
-          THREADS=$(($(nproc) * 3 / 2))
+          THREADS=$(( $(nproc) * 3 / 2 ))
           echo "🔧 Compiling with $THREADS threads..."
-          
-          # Compilation retry logic
-          if ! make -j$THREADS; then
-            echo "⚠️ First compilation attempt failed, retrying with single thread..."
+          if ! make -j"$THREADS"; then
+            echo "⚠️ First attempt failed, retrying with -j1 ..."
             if ! make -j1; then
-              echo "⚠️ Second compilation attempt failed, enabling verbose output..."
+              echo "⚠️ Second attempt failed, running verbose ..."
               make -j1 V=s
             fi
           fi
-          
-          # Extract device name
-          DEVICE_NAME=$(grep -oP 'CONFIG_TARGET.*DEVICE_\K[^=]+(?=y)' .config | head -n1)
-          if [ -n "$DEVICE_NAME" ]; then
-            echo "✅ Device Name: $DEVICE_NAME"
-            echo "DEVICE_NAME=$DEVICE_NAME" >> $GITHUB_ENV
-          else
-            echo "⚠️ Could not determine device name"
-            echo "DEVICE_NAME=unknown" >> $GITHUB_ENV
-          fi
-          
-          # Set file date
+
+          DEVICE_NAME=$(grep -oP 'CONFIG_TARGET.*DEVICE_\K[^=]+(?=y)' .config | head -n1 || true)
+          if [ -z "$DEVICE_NAME" ]; then DEVICE_NAME=unknown; fi
           FILE_DATE=$(date +"%Y%m%d%H%M")
+          echo "✅ Device Name: $DEVICE_NAME"
           echo "📅 File Date: $FILE_DATE"
-          echo "FILE_DATE=$FILE_DATE" >> $GITHUB_ENV
-          echo "status=success" >> $GITHUB_OUTPUT
+          echo "DEVICE_NAME=$DEVICE_NAME" >> "$GITHUB_ENV"
+          echo "FILE_DATE=$FILE_DATE"     >> "$GITHUB_ENV"
+          echo "deviceName=$DEVICE_NAME"  >> "$GITHUB_OUTPUT"
+          echo "fileDate=$FILE_DATE"      >> "$GITHUB_OUTPUT"
+          echo "status=success"           >> "$GITHUB_OUTPUT"
 
       - name: Check Disk Space (After Compilation)
         run: |
           echo "💾 Disk Space After Compilation:"
-          echo "=============================================================="
           df -hT
-          echo "=============================================================="
 
-      # ====================== Output Processing ======================
       - name: Upload Bin Directory
         if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
         uses: actions/upload-artifact@v4
@@ -317,10 +251,9 @@ jobs:
         if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
         run: |
           cd openwrt/bin/targets/*/*
-          echo "📦 Preparing firmware files..."
           rm -rf packages
-          echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-          echo "status=success" >> $GITHUB_OUTPUT
+          echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
+          echo "status=success" >> "$GITHUB_OUTPUT"
 
       - name: Upload Firmware Files
         if: steps.prepare.outputs.status == 'success' && !cancelled()
@@ -334,67 +267,49 @@ jobs:
         if: env.UPLOAD_RELEASE == 'true' && !cancelled()
         run: |
           cd openwrt
-          
           DEVICE_MODEL=$(grep 'CONFIG_TARGET_PROFILE=' .config | awk -F'"' '{print $2}' | sed 's/^DEVICE_//')
-          if [ -z "$DEVICE_MODEL" ]; then
-              DEVICE_MODEL="unknown_device"
-          fi
-          
+          [ -z "$DEVICE_MODEL" ] && DEVICE_MODEL="unknown_device"
           TARGET_ARCH=$(grep 'CONFIG_TARGET_ARCH_PACKAGES=' .config | awk -F'"' '{print $2}')
-          if [ -z "$TARGET_ARCH" ]; then
-              TARGET_ARCH="unknown_arch"
-          fi
-          
+          [ -z "$TARGET_ARCH" ] && TARGET_ARCH="unknown_arch"
           TARGET_BOARD=$(grep 'CONFIG_TARGET_BOARD=' .config | awk -F'"' '{print $2}')
           TARGET_SUBTARGET=$(grep 'CONFIG_TARGET_SUBTARGET=' .config | awk -F'"' '{print $2}')
           DEVICE_INFO="${TARGET_BOARD}/${TARGET_SUBTARGET}"
           PLUGINS=$(grep '^CONFIG_PACKAGE_luci-app-[a-z-]*=y$' .config | sed 's/^CONFIG_PACKAGE_//;s/=y$//' | sort)
           RELEASE_TAG="$(date +"%Y.%m.%d-%H%M")-${DEVICE_INFO}-${DEVICE_MODEL}-${TARGET_ARCH}"
-          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
-          cat > release.txt <<EOF
-          ### 🚀${DEVICE_MODEL}-${DEFAULT_HOSTNAME} Firmware
-
-          - 🌐Admin URL: ${LAN_IP}
-          - 🔑Login: root
-          - 🔒Password: none
-          - 📋Device Info: ${DEVICE_INFO}
-          - 🖥️Device Model: ${DEVICE_MODEL}
-          - 🏗️Device Arch: ${TARGET_ARCH}
-          - 💿System Version: ${SYSTEM_VERSION}
-          - ⚙️Kernel Version: ${KERNEL_VERSION}
-
-          #### 📦Plugins
-          \`\`\`
-          EOF
-
-          count=0
-          if [ -n "$PLUGINS" ]; then
-              while IFS= read -r plugin; do
-                  count=$((count + 1))
-                  echo "${count}. ${plugin}" >> release.txt
-              done <<< "$PLUGINS"
-          else
-              echo "none" >> release.txt
-          fi
-
-          cat >> release.txt <<EOF
-          \`\`\`
-
-          #### 🔧Build Information
-          - Build Time: $(date +"%Y-%m-%d %H:%M:%S %Z")
-          - Source URL: ${REPO_URL}
-          - Source Branch: ${REPO_BRANCH}
-          EOF
+          {
+            echo "### 🚀${DEVICE_MODEL}-${DEFAULT_HOSTNAME} Firmware"
+            echo ""
+            echo "- 🌐Admin URL: ${LAN_IP}"
+            echo "- 🔑Login: root"
+            echo "- 🔒Password: none"
+            echo "- 📋Device Info: ${DEVICE_INFO}"
+            echo "- 🖥️Device Model: ${DEVICE_MODEL}"
+            echo "- 🏗️Device Arch: ${TARGET_ARCH}"
+            echo "- 💿System Version: ${SYSTEM_VERSION}"
+            echo "- ⚙️Kernel Version: ${KERNEL_VERSION}"
+            echo ""
+            echo "#### 📦Plugins"
+            echo '```'
+            if [ -n "$PLUGINS" ]; then
+              i=0
+              while IFS= read -r p; do i=$((i+1)); echo "$i. $p"; done <<< "$PLUGINS"
+            else
+              echo "none"
+            fi
+            echo '```'
+            echo ""
+            echo "#### 🔧Build Information"
+            echo "- Build Time: $(date +"%Y-%m-%d %H:%M:%S %Z")"
+            echo "- Source URL: ${REPO_URL}"
+            echo "- Source Branch: ${REPO_BRANCH}"
+          } > ../release_content.txt
 
           echo "======= release.txt content ======="
-          cat release.txt
+          cat ../release_content.txt
           echo "=================================="
-
-          mv release.txt ../release_content.txt
-          
-          echo "📝 Release information generated"
-          echo "status=success" >> $GITHUB_OUTPUT
+          echo "status=success" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         if: steps.release_info.outputs.status == 'success' && !cancelled()
@@ -405,15 +320,16 @@ jobs:
           tag_name: ${{ steps.release_info.outputs.release_tag }}
           body_path: release_content.txt
           files: ${{ env.FIRMWARE }}/*
-      # ====================== Cleanup Phase ======================
+
       - name: Cleanup Old Workflow Runs
+        if: always()
         uses: Mattraks/delete-workflow-runs@v2
         with:
           retain_days: 3
           keep_minimum_runs: 3
 
       - name: Cleanup Old Releases
-        if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+        if: always() && env.UPLOAD_RELEASE == 'true' && !cancelled()
         uses: dev-drprasad/delete-older-releases@v0.3.4
         with:
           keep_latest: 3
